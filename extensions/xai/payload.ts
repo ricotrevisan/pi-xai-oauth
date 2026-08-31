@@ -432,6 +432,50 @@ export function omitConsumedXaiResponsesVisionImages(
   return changed ? { ...payload, input: rewritten } : payload;
 }
 
+
+export const XAI_REJECTED_INLINE_IMAGE_PLACEHOLDER =
+  "[image removed — the xAI OAuth server could not process it; continue without relying on its contents]";
+
+function rejectedInlineImagePlaceholder(
+  value: unknown,
+): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const part = value as Record<string, unknown>;
+  const reference = imageReferenceValue(part);
+  if (
+    (part.type === "input_image" || part.type === "image_url") &&
+    typeof reference === "string" &&
+    /^data:image\//i.test(reference.trim())
+  ) {
+    return { type: "input_text", text: XAI_REJECTED_INLINE_IMAGE_PLACEHOLDER };
+  }
+  return undefined;
+}
+
+/** Replace rejected inline user-image parts with a fixed placeholder while preserving remote and opaque inputs. */
+export function omitRejectedXaiInlineImages(
+  payload: Record<string, unknown>,
+): Record<string, unknown> {
+  if (!Array.isArray(payload.input)) return payload;
+  let changed = false;
+  const input = payload.input.map((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+    const item = value as Record<string, unknown>;
+    if (item.role !== "user" || !Array.isArray(item.content)) return value;
+    let contentChanged = false;
+    const content = item.content.map((part) => {
+      const placeholder = rejectedInlineImagePlaceholder(part);
+      if (!placeholder) return part;
+      contentChanged = true;
+      return placeholder;
+    });
+    if (!contentChanged) return value;
+    changed = true;
+    return { ...item, content };
+  });
+  return changed ? { ...payload, input } : payload;
+}
+
 function normalizeXaiResponsesInput(
   input: unknown[],
   model: Model<Api>,

@@ -12,9 +12,28 @@ import {
   KNOWN_XAI_MODEL_METADATA,
   setXaiRuntimeModels,
 } from "../../extensions/xai/models";
-import { streamSimpleXaiResponses } from "../../extensions/xai/responses";
+import { createXaiResponse, streamSimpleXaiResponses } from "../../extensions/xai/responses";
 import { jsonResponse } from "../fixtures/http";
+import { noisePngBytes } from "../fixtures/images";
 import { TEST_MODEL } from "../fixtures/models";
+
+function completedStreamResponse() {
+  const response = {
+    id: "resp",
+    status: "completed",
+    output: [],
+    usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+  };
+  const events = [
+    { type: "response.created", response: { id: response.id } },
+    { type: "response.completed", response },
+  ];
+  return new Response(
+    `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`,
+    { headers: { "content-type": "text/event-stream" } },
+  );
+}
+
 beforeEach(() => {
   setXaiRuntimeModels(KNOWN_XAI_MODEL_METADATA);
   vi.stubGlobal(
@@ -231,6 +250,158 @@ describe("xAI streaming adapter", () => {
     expect(events.at(-1).type).toBe("error");
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
+  it("retries an image rejection without inline images so the turn can complete", async () => {
+    const requests: any[] = [];
+    const requestIds: Array<string | null> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: any, init: RequestInit = {}) => {
+      requests.push(JSON.parse(String(init.body)));
+      requestIds.push(new Headers(init.headers).get("x-grok-req-id"));
+      return requests.length === 1
+        ? jsonResponse({ code: "invalid_image", error: "Invalid image." }, 400)
+        : completedStreamResponse();
+    }));
+    const stream = streamSimpleXaiResponses(
+      TEST_MODEL,
+      {
+        messages: [{
+          role: "user",
+          content: [
+            { type: "text", text: "What is shown?" },
+            { type: "image", data: noisePngBytes(32, 16).toString("base64"), mimeType: "image/png" },
+          ],
+          timestamp: Date.now(),
+        }],
+      } as any,
+      {
+        apiKey: "oauth-token",
+        sessionId: "session",
+        onPayload(payload: any) {
+          const user = payload.input.find((item: any) => item.role === "user");
+          user.content.push({
+            type: "input_image",
+            image_url: "https://example.test/remote.png",
+            detail: "auto",
+          });
+        },
+      } as any,
+    );
+    const result = await stream.result();
+
+    expect(result.errorMessage).toBeUndefined();
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[0])).toContain("data:image/png;base64,");
+    expect(JSON.stringify(requests[1])).not.toContain("data:image/");
+    expect(JSON.stringify(requests[1])).toContain("https://example.test/remote.png");
+    expect(JSON.stringify(requests[1])).toMatch(/image removed.*server could not process/i);
+    expect(requestIds[0]).toBeTruthy();
+    expect(requestIds[1]).toBeTruthy();
+    expect(requestIds[1]).not.toBe(requestIds[0]);
+  });
+
+  it("stops after one failed image-recovery attempt", async () => {
+    const requests: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: any, init: RequestInit = {}) => {
+      requests.push(JSON.parse(String(init.body)));
+      return jsonResponse({ code: "invalid_image", error: "Invalid image." }, 400);
+    }));
+    const stream = streamSimpleXaiResponses(
+      TEST_MODEL,
+      {
+        messages: [{
+          role: "user",
+          content: [
+            { type: "text", text: "What is shown?" },
+            { type: "image", data: noisePngBytes(32, 16).toString("base64"), mimeType: "image/png" },
+          ],
+          timestamp: Date.now(),
+        }],
+      } as any,
+      { apiKey: "oauth-token", sessionId: "session" } as any,
+    );
+    const result = await stream.result();
+
+    expect(result.errorMessage).toMatch(/^xAI API error/i);
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[0])).toContain("data:image/png;base64,");
+    expect(JSON.stringify(requests[1])).not.toContain("data:image/");
+  });
+
+  it("does not lend a stream's image retry to a concurrent direct request", async () => {
+    let markStreamStarted: () => void = () => {};
+    const streamStarted = new Promise<void>((resolve) => {
+      markStreamStarted = resolve;
+    });
+    let releaseStream: () => void = () => {};
+    const streamRelease = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+    const requests: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: any, init: RequestInit = {}) => {
+      const body = JSON.parse(String(init.body));
+      requests.push(body);
+      if (JSON.stringify(body).includes("hold stream")) {
+        markStreamStarted();
+        await streamRelease;
+        return completedStreamResponse();
+      }
+      return jsonResponse({ code: "invalid_image", error: "Invalid image." }, 400);
+    }));
+    const stream = streamSimpleXaiResponses(
+      TEST_MODEL,
+      { messages: [{ role: "user", content: "hold stream", timestamp: Date.now() }] } as any,
+      { apiKey: "oauth-token", sessionId: "stream-session" } as any,
+    );
+
+    await streamStarted;
+    try {
+      await expect(createXaiResponse(
+        { kind: "oauth-session", token: "oauth-token" },
+        {
+          model: TEST_MODEL.id,
+          input: [{
+            role: "user",
+            content: [
+              { type: "input_text", text: "direct request" },
+              {
+                type: "input_image",
+                image_url: `data:image/png;base64,${noisePngBytes(32, 16).toString("base64")}`,
+              },
+            ],
+          }],
+        },
+      )).rejects.toThrow(/^xAI API error/i);
+      expect(requests.filter((body) => JSON.stringify(body).includes("direct request"))).toHaveLength(1);
+    } finally {
+      releaseStream();
+    }
+    await stream.result();
+  });
+
+  it("does not retry an unrelated 400 even when the request contains an inline image", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ code: "invalid_request", error: "Bad request." }, 400)),
+    );
+    const stream = streamSimpleXaiResponses(
+      TEST_MODEL,
+      {
+        messages: [{
+          role: "user",
+          content: [
+            { type: "text", text: "What is shown?" },
+            { type: "image", data: noisePngBytes(32, 16).toString("base64"), mimeType: "image/png" },
+          ],
+          timestamp: Date.now(),
+        }],
+      } as any,
+      { apiKey: "oauth-token", sessionId: "session" } as any,
+    );
+    const result = await stream.result();
+
+    expect(result.errorMessage).toMatch(/^xAI API error/i);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+  });
+
   it("forwards an xAI-labeled terminal error when transport throws", async () => {
     vi.stubGlobal(
       "fetch",

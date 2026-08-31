@@ -21,6 +21,7 @@ import {
   exposeGrokNativeToolNames,
   internalizeGrokNativeToolCalls,
   omitConsumedXaiResponsesVisionImages,
+  omitRejectedXaiInlineImages,
   rewriteXaiResponsesPayload,
   type GrokNativeToolRoutes,
   XAI_PAYLOAD_CANONICALIZATION_ERROR,
@@ -63,6 +64,7 @@ const SAFE_PAYLOAD_MODEL_ERROR =
   "xAI OAuth payload hooks cannot change the selected model; no xAI request was sent";
 
 const guardedRedirectUrls = new Map<string, number>();
+const invalidImageRetryRequestIds = new Set<string>();
 let unguardedFetch: typeof fetch | undefined;
 let redirectGuardFetch: typeof fetch | undefined;
 
@@ -70,7 +72,49 @@ function fetchRequestUrl(input: string | URL | Request): string {
   return input instanceof Request ? input.url : String(input);
 }
 
-function acquireRedirectGuard(url: string): () => void {
+function invalidImageRetryInit(
+  input: string | URL | Request,
+  init?: RequestInit,
+): RequestInit | undefined {
+  if (typeof init?.body !== "string") return undefined;
+  let payload: unknown;
+  try {
+    payload = JSON.parse(init.body);
+  } catch {
+    return undefined;
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return undefined;
+  }
+  const rewritten = omitRejectedXaiInlineImages(
+    payload as Record<string, unknown>,
+  );
+  if (rewritten === payload) return undefined;
+  if (typeof rewritten.model !== "string") return undefined;
+  assertXaiRuntimeModelAcceptsPayload(rewritten.model, rewritten);
+
+  const headers = new Headers(
+    init.headers ?? (input instanceof Request ? input.headers : undefined),
+  );
+  headers.set("x-grok-req-id", randomUUID());
+  return {
+    ...init,
+    body: JSON.stringify(rewritten),
+    headers,
+    redirect: "error",
+  };
+}
+
+function fetchRequestHeader(
+  input: string | URL | Request,
+  init: RequestInit | undefined,
+  name: string,
+): string | null {
+  const headers = init?.headers ?? (input instanceof Request ? input.headers : undefined);
+  return new Headers(headers).get(name);
+}
+
+function acquireRedirectGuard(url: string, invalidImageRetryRequestId: string): () => void {
   if (!redirectGuardFetch) {
     unguardedFetch = globalThis.fetch;
     const baseFetch = unguardedFetch;
@@ -84,11 +128,30 @@ function acquireRedirectGuard(url: string): () => void {
       if (!guarded || response.ok) return response;
       const requestSignal =
         init?.signal ?? (input instanceof Request ? input.signal : undefined);
-      const error = await xaiHttpErrorFromResponse(
-        response,
+      let failedResponse = response;
+      let error = await xaiHttpErrorFromResponse(
+        failedResponse,
         url,
         requestSignal,
       );
+      const requestId = fetchRequestHeader(input, init, "x-grok-req-id");
+      if (
+        error.code === "invalid-image" &&
+        requestId !== null &&
+        invalidImageRetryRequestIds.has(requestId) &&
+        !requestSignal?.aborted
+      ) {
+        const retryInit = invalidImageRetryInit(input, init);
+        if (retryInit && !requestSignal?.aborted) {
+          failedResponse = await baseFetch(input, retryInit);
+          if (failedResponse.ok) return failedResponse;
+          error = await xaiHttpErrorFromResponse(
+            failedResponse,
+            url,
+            requestSignal,
+          );
+        }
+      }
       const marker =
         error.code === "encrypted-content-mismatch"
           ? "encrypted_content"
@@ -96,19 +159,21 @@ function acquireRedirectGuard(url: string): () => void {
             ? "update_required"
             : "request failed";
       return new Response(JSON.stringify({ error: { message: marker } }), {
-        status: response.status,
-        statusText: response.statusText,
+        status: failedResponse.status,
+        statusText: failedResponse.statusText,
         headers: { "Content-Type": "application/json" },
       });
     };
     globalThis.fetch = redirectGuardFetch;
   }
   guardedRedirectUrls.set(url, (guardedRedirectUrls.get(url) ?? 0) + 1);
+  invalidImageRetryRequestIds.add(invalidImageRetryRequestId);
 
   let released = false;
   return () => {
     if (released) return;
     released = true;
+    invalidImageRetryRequestIds.delete(invalidImageRetryRequestId);
     const remaining = (guardedRedirectUrls.get(url) ?? 1) - 1;
     if (remaining > 0) guardedRedirectUrls.set(url, remaining);
     else guardedRedirectUrls.delete(url);
@@ -646,7 +711,10 @@ export function streamSimpleXaiResponses(
     // Keep one URL-scoped guard installed only for the lifetime of active xAI
     // streams; unrelated requests pass through unchanged, and overlapping xAI
     // streams share the same guard until the last request completes.
-    const releaseRedirectGuard = acquireRedirectGuard(route.url);
+    const releaseRedirectGuard = acquireRedirectGuard(
+      route.url,
+      requestHeaders["x-grok-req-id"],
+    );
     try {
       const inner = streamSimpleOpenAIResponses(
         openAIResponsesModel as Model<"openai-responses">,

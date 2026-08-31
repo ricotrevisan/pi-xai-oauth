@@ -269,6 +269,21 @@ function isEncryptedContentMismatch(
   return streamedFailure && INVALID_REQUEST_PATTERN.test(detail);
 }
 
+function isInvalidImageRejection(
+  status: number,
+  detail: string,
+  routeKind: XaiHttpRouteKind,
+): boolean {
+  if (status !== 400 || routeKind !== "responses-proxy") return false;
+  try {
+    const body = JSON.parse(detail);
+    return !!body && typeof body === "object" && !Array.isArray(body) &&
+      body.code === "invalid_image";
+  } catch {
+    return false;
+  }
+}
+
 function routeLabel(routeKind: XaiHttpRouteKind): string {
   if (routeKind === "responses-proxy" || routeKind === "responses-direct")
     return "Responses";
@@ -326,7 +341,7 @@ export function safeXaiTransportErrorMessage(
 export class XaiHttpError extends Error {
   readonly status: number;
   readonly routeKind: XaiHttpRouteKind;
-  readonly code: "encrypted-content-mismatch" | "proxy-version-gate" | "http";
+  readonly code: "encrypted-content-mismatch" | "proxy-version-gate" | "invalid-image" | "http";
 
   constructor(status: number, routeKind: XaiHttpRouteKind, detail = "") {
     super(safeXaiTransportErrorMessage(detail, status, routeKind));
@@ -337,7 +352,9 @@ export class XaiHttpError extends Error {
       ? "encrypted-content-mismatch"
       : routeKind === "responses-proxy" && isProxyVersionGate(status, detail)
         ? "proxy-version-gate"
-        : "http";
+        : isInvalidImageRejection(status, detail, routeKind)
+          ? "invalid-image"
+          : "http";
   }
 }
 

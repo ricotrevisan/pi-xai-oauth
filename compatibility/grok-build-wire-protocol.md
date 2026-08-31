@@ -84,6 +84,18 @@ Unsuccessful direct HTTP responses are read through a 16 KiB bound for classific
 
 Catalog, OAuth, OIDC, and device paths retain their existing stricter endpoint, response-size, cancellation, and secret-redaction rules.
 
+## Inline image rejection recovery
+
+The pinned OAuth Responses proxy can reject an otherwise valid inline `data:image/...` input with HTTP 400 and top-level code `invalid_image`. For that exact bounded classification, streaming makes one package-owned recovery attempt:
+
+- only inline image parts are replaced with a fixed text placeholder; HTTPS image inputs remain unchanged;
+- the retry keeps the selected model and session/conversation IDs, rechecks the current runtime entitlement, and receives a fresh `x-grok-req-id`;
+- the underlying fetch is called directly for the second attempt, so recovery cannot recurse;
+- unrelated failures, requests without removable inline images, cancellation, and a failed recovery retain the normal redacted terminal error;
+- no image is uploaded, persisted, or routed through an unreviewed storage endpoint.
+
+This follows Grok Build's bounded strip-and-retry behavior while keeping Pi's session history unchanged. A successful assistant response makes a pending tool-result image historical, so existing consumed-image cleanup prevents it from poisoning later turns.
+
 ## Encrypted reasoning boundary (#79)
 
 Issue [#79](https://github.com/BlockedPath/pi-xai-oauth/issues/79) implements the reviewed contract on the pinned OAuth streaming and direct Responses routes:

@@ -14,6 +14,7 @@ import {
   canonicalizeXaiResponsesPayload,
   exposeGrokNativeToolNames,
   internalizeGrokNativeToolCalls,
+  omitRejectedXaiInlineImages,
   rewriteXaiResponsesPayload,
   xaiPayloadGrokNativeToolRoutes,
   XAI_PAYLOAD_CANONICALIZATION_ERROR,
@@ -125,6 +126,42 @@ const convertVisionHistory = (assistantContent: any[], terminalAfterTools = fals
 };
 
 describe("Responses payload normalization", () => {
+  it("replaces only inline user-image parts after a server rejection", () => {
+    const opaque = {
+      type: "input_image",
+      image_url: "data:image/png;base64,b3BhcXVl",
+    };
+    const remote = {
+      type: "input_image",
+      image_url: "https://example.test/remote.png",
+    };
+    const payload = {
+      model: TEST_MODEL.id,
+      tools: [{ type: "function", name: "inspect", metadata: opaque }],
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: "inspect" },
+            { type: "input_image", image_url: "data:image/png;base64,aW1hZ2U=" },
+            remote,
+            { type: "input_text", text: "keep metadata", metadata: opaque },
+          ],
+        },
+        { type: "function_call", call_id: "call", name: "inspect", arguments: JSON.stringify(opaque) },
+      ],
+    };
+
+    const rewritten = omitRejectedXaiInlineImages(payload);
+    const content = (rewritten.input as any[])[0].content;
+    expect(content[1]).toMatchObject({ type: "input_text" });
+    expect(content[1].text).toMatch(/image removed.*server could not process/i);
+    expect(content[2]).toBe(remote);
+    expect(content[3].metadata).toBe(opaque);
+    expect(rewritten.tools).toBe(payload.tools);
+    expect((payload.input[0] as any).content[1]).toMatchObject({ type: "input_image" });
+  });
+
   it("exposes and internalizes the collision-free Grok web-search dispatch name", () => {
     const payload = {
       tools: [{ type: "function", name: XAI_GROK_NATIVE_WEB_SEARCH_DISPATCH_NAME }],

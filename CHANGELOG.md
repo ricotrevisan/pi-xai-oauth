@@ -6,6 +6,10 @@ Dates below are npm publication dates. The earliest rapid-release series is grou
 
 ## Unreleased
 
+### Fixed
+
+- Recover from xAI OAuth `invalid_image` rejections by retrying once without rejected inline images, while preserving remote image inputs and replacing removed images with an explicit placeholder.
+
 ## 1.5.2 - 2026-08-23
 
 ### Fixed
