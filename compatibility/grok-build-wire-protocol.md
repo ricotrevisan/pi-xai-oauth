@@ -86,11 +86,11 @@ Catalog, OAuth, OIDC, and device paths retain their existing stricter endpoint, 
 
 ## Inline image rejection recovery
 
-The pinned OAuth Responses proxy can reject an otherwise valid inline `data:image/...` input with HTTP 400 and top-level code `invalid_image`. For that exact bounded classification, streaming makes one package-owned recovery attempt:
+The pinned OAuth Responses proxy can reject an otherwise valid inline `data:image/...` input with HTTP 400 and top-level code `invalid_image`. For that exact bounded classification, streaming and routed vision requests make one package-owned recovery attempt through their active per-request transport:
 
 - only inline image parts are replaced with a fixed text placeholder; HTTPS image inputs remain unchanged;
 - the retry keeps the selected model and session/conversation IDs, rechecks the current runtime entitlement, and receives a fresh `x-grok-req-id`;
-- the underlying fetch is called directly for the second attempt, so recovery cannot recurse;
+- the selected fetch transport is wrapped per request and called directly for the second attempt, so recovery cannot recurse or affect unrelated concurrent requests;
 - unrelated failures, requests without removable inline images, cancellation, and a failed recovery retain the normal redacted terminal error;
 - no image is uploaded, persisted, or routed through an unreviewed storage endpoint.
 

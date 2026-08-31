@@ -298,6 +298,88 @@ describe("xAI streaming adapter", () => {
     expect(requestIds[1]).not.toBe(requestIds[0]);
   });
 
+  it.skipIf(process.env.PI_COMPAT_MATRIX_VERSION === "0.80.1")(
+    "recovers through the caller-provided fetch transport",
+    async () => {
+    const requests: any[] = [];
+    const transportFetch = vi.fn(async (_url: any, init: RequestInit = {}) => {
+      requests.push(JSON.parse(String(init.body)));
+      return requests.length === 1
+        ? jsonResponse({ code: "invalid_image", error: "Invalid image." }, 400)
+        : completedStreamResponse();
+    });
+    vi.stubGlobal("fetch", vi.fn(() => {
+      throw new Error("global fetch should not be used");
+    }));
+
+    const stream = streamSimpleXaiResponses(
+      TEST_MODEL,
+      {
+        messages: [{
+          role: "user",
+          content: [
+            { type: "text", text: "What is shown?" },
+            { type: "image", data: noisePngBytes(32, 16).toString("base64"), mimeType: "image/png" },
+          ],
+          timestamp: Date.now(),
+        }],
+      } as any,
+      {
+        apiKey: "oauth-token",
+        sessionId: "session",
+        fetch: transportFetch,
+      } as any,
+    );
+    const result = await stream.result();
+
+    expect(result.errorMessage).toBeUndefined();
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[0])).toContain("data:image/png;base64,");
+    expect(JSON.stringify(requests[1])).not.toContain("data:image/");
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    },
+  );
+
+  it.skipIf(process.env.PI_COMPAT_MATRIX_VERSION === "0.80.1")(
+    "does not install a decorating caller transport globally",
+    async () => {
+    const requests: any[] = [];
+    const baseFetch = vi.fn(async (_url: any, init: RequestInit = {}) => {
+      requests.push(JSON.parse(String(init.body)));
+      return requests.length === 1
+        ? jsonResponse({ code: "invalid_image", error: "Invalid image." }, 400)
+        : completedStreamResponse();
+    });
+    vi.stubGlobal("fetch", baseFetch);
+    const transportFetch = vi.fn((input: any, init?: RequestInit) =>
+      globalThis.fetch(input, init));
+
+    const stream = streamSimpleXaiResponses(
+      TEST_MODEL,
+      {
+        messages: [{
+          role: "user",
+          content: [
+            { type: "text", text: "What is shown?" },
+            { type: "image", data: noisePngBytes(32, 16).toString("base64"), mimeType: "image/png" },
+          ],
+          timestamp: Date.now(),
+        }],
+      } as any,
+      {
+        apiKey: "oauth-token",
+        sessionId: "session",
+        fetch: transportFetch,
+      } as any,
+    );
+    const result = await stream.result();
+
+    expect(result.errorMessage).toBeUndefined();
+    expect(requests).toHaveLength(2);
+    expect(globalThis.fetch).toBe(baseFetch);
+    },
+  );
+
   it("stops after one failed image-recovery attempt", async () => {
     const requests: any[] = [];
     vi.stubGlobal("fetch", vi.fn(async (_url: any, init: RequestInit = {}) => {

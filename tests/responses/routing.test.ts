@@ -262,7 +262,7 @@ describe("Responses routing and protected metadata", () => {
     },
   );
 
-  it("scopes redirect rejection across overlapping xAI streams", async () => {
+  it("keeps redirect rejection scoped to overlapping xAI streams", async () => {
     const pending: Array<() => void> = [];
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const baseFetch = vi.fn(async (url: any, init: RequestInit = {}) => {

@@ -490,6 +490,67 @@ describe("opt-in vision routing", () => {
     }
   });
 
+  it("recovers routed vision through the caller-provided fetch transport", async () => {
+    const insideDir = mkdtempSync(join(process.cwd(), ".xai-vision-inside-"));
+    const inside = join(insideDir, "inside.png");
+    writeFileSync(inside, tinyPngBytes());
+    try {
+      const controller = createXaiVisionRoutingController();
+      controller.replaceCatalog([source, target]);
+      controller.enable(sourceModel);
+      const requests: any[] = [];
+      let targetAttempts = 0;
+      const transportFetch = vi.fn(async (_url: any, init: RequestInit = {}) => {
+        const body = requestBody(init);
+        requests.push(body);
+        if (body.model !== target.id) return streamResponse();
+        targetAttempts++;
+        return targetAttempts === 1
+          ? jsonResponse({ code: "invalid_image", error: "Invalid image." }, 400)
+          : jsonResponse({ id: "vision", output_text: "Image unavailable." });
+      });
+      vi.stubGlobal("fetch", vi.fn(async (_url: any, init: RequestInit = {}) => {
+        const body = requestBody(init);
+        if (body.model === target.id) {
+          throw new Error("routed vision must use the caller-provided transport");
+        }
+        requests.push(body);
+        return streamResponse();
+      }));
+
+      const stream = streamSimpleXaiResponses(
+        sourceModel,
+        { messages: [{ role: "user", content: "inspect", timestamp: Date.now() }] } as any,
+        {
+          apiKey: "oauth-token",
+          fetch: transportFetch,
+          onPayload(payload: any) {
+            payload.input = [{
+              role: "user",
+              content: [{
+                type: "image",
+                source: { type: "url", url: inside },
+              }],
+            }];
+          },
+        } as any,
+        controller,
+      );
+      const result = await stream.result();
+
+      expect(result.errorMessage).toBeUndefined();
+      expect(requests).toHaveLength(3);
+      expect(targetAttempts).toBe(2);
+      expect(JSON.stringify(requests[0])).toContain("data:image/png;base64,");
+      expect(JSON.stringify(requests[1])).not.toContain("data:image/");
+      expect(JSON.stringify(requests[1])).toMatch(/image removed.*server could not process/i);
+      expect(JSON.stringify(requests[2])).toContain("Image unavailable.");
+      expect(JSON.stringify(requests)).not.toContain(inside);
+    } finally {
+      rmSync(insideDir, { recursive: true, force: true });
+    }
+  });
+
   it("rejects an outside image source in vision routing before fetch without reflecting it", async () => {
     const outsideDir = mkdtempSync(join(tmpdir(), "xai-vision-outside-"));
     const outside = join(outsideDir, "SENSITIVE-outside.png");

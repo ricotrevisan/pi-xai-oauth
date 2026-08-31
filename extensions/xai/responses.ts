@@ -41,11 +41,16 @@ import {
 import {
   safeXaiTransportErrorMessage,
   scrubXaiReservedHeaders,
+  XaiHttpError,
   XAI_ENCRYPTED_CONTENT_MISMATCH_MESSAGE,
   xaiHttpErrorFromResponse,
   xaiJsonPostHeaders,
   xaiProxyRequestHeaders,
 } from "./wire";
+
+type XaiSimpleStreamOptions = SimpleStreamOptions & {
+  fetch?: typeof fetch;
+};
 
 interface AssistantStreamEvent {
   type: string;
@@ -67,7 +72,6 @@ const guardedRedirectUrls = new Map<string, number>();
 const invalidImageRetryRequestIds = new Set<string>();
 let unguardedFetch: typeof fetch | undefined;
 let redirectGuardFetch: typeof fetch | undefined;
-
 function fetchRequestUrl(input: string | URL | Request): string {
   return input instanceof Request ? input.url : String(input);
 }
@@ -110,8 +114,60 @@ function fetchRequestHeader(
   init: RequestInit | undefined,
   name: string,
 ): string | null {
-  const headers = init?.headers ?? (input instanceof Request ? input.headers : undefined);
+  const headers =
+    init?.headers ?? (input instanceof Request ? input.headers : undefined);
   return new Headers(headers).get(name);
+}
+
+function createXaiResponsesFetch(
+  baseFetch: typeof fetch,
+  guardedUrl: string,
+  invalidImageRetryRequestId: string,
+): typeof fetch {
+  return async (input, init) => {
+    const url = fetchRequestUrl(input);
+    if (url !== guardedUrl) return baseFetch(input, init);
+
+    const response = await baseFetch(input, { ...init, redirect: "error" });
+    if (response.ok) return response;
+
+    const requestSignal =
+      init?.signal ?? (input instanceof Request ? input.signal : undefined);
+    let failedResponse = response;
+    let error = await xaiHttpErrorFromResponse(
+      failedResponse,
+      url,
+      requestSignal,
+    );
+    const requestId = fetchRequestHeader(input, init, "x-grok-req-id");
+    if (
+      error.code === "invalid-image" &&
+      requestId === invalidImageRetryRequestId &&
+      !requestSignal?.aborted
+    ) {
+      const retryInit = invalidImageRetryInit(input, init);
+      if (retryInit && !requestSignal?.aborted) {
+        failedResponse = await baseFetch(input, retryInit);
+        if (failedResponse.ok) return failedResponse;
+        error = await xaiHttpErrorFromResponse(
+          failedResponse,
+          url,
+          requestSignal,
+        );
+      }
+    }
+    const marker =
+      error.code === "encrypted-content-mismatch"
+        ? "encrypted_content"
+        : error.code === "proxy-version-gate"
+          ? "update_required"
+          : "request failed";
+    return new Response(JSON.stringify({ error: { message: marker } }), {
+      status: failedResponse.status,
+      statusText: failedResponse.statusText,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
 }
 
 function acquireRedirectGuard(url: string, invalidImageRetryRequestId: string): () => void {
@@ -126,6 +182,10 @@ function acquireRedirectGuard(url: string, invalidImageRetryRequestId: string): 
         guarded ? { ...init, redirect: "error" } : init,
       );
       if (!guarded || response.ok) return response;
+      const requestId = fetchRequestHeader(input, init, "x-grok-req-id");
+      if (requestId === null || !invalidImageRetryRequestIds.has(requestId)) {
+        return response;
+      }
       const requestSignal =
         init?.signal ?? (input instanceof Request ? input.signal : undefined);
       let failedResponse = response;
@@ -134,11 +194,8 @@ function acquireRedirectGuard(url: string, invalidImageRetryRequestId: string): 
         url,
         requestSignal,
       );
-      const requestId = fetchRequestHeader(input, init, "x-grok-req-id");
       if (
         error.code === "invalid-image" &&
-        requestId !== null &&
-        invalidImageRetryRequestIds.has(requestId) &&
         !requestSignal?.aborted
       ) {
         const retryInit = invalidImageRetryInit(input, init);
@@ -426,6 +483,7 @@ function streamErrorMessage(model: Model<Api>, error: unknown) {
  * @param signal Optional cancellation signal forwarded to fetch and bounded body reads.
  * @param contractHeaders Approved internally owned proxy metadata.
  * @param maxResponseBytes Optional response bound used by strict auxiliary Responses calls.
+ * @param transportFetch Optional caller-provided fetch transport.
  * @returns The parsed successful JSON response.
  * @throws {XaiHttpError} For non-success HTTP responses, with only safe route/status detail.
  * @throws {Error} When a bounded auxiliary response is oversized or malformed.
@@ -437,8 +495,9 @@ export async function postXaiJson(
   signal?: AbortSignal,
   contractHeaders: Record<string, string> = {},
   maxResponseBytes?: number,
+  transportFetch: typeof fetch = globalThis.fetch,
 ): Promise<any> {
-  const response = await fetch(url, {
+  const response = await transportFetch(url, {
     method: "POST",
     headers: xaiJsonPostHeaders(authToken, contractHeaders),
     body: JSON.stringify(body),
@@ -514,6 +573,8 @@ export function assertXaiRuntimeModelAcceptsPayload(
  * @param signal Optional cancellation signal for transport and bounded response reads.
  * @param beforeSend Optional final guard invoked after local validation and before network I/O.
  * @param maxResponseBytes Optional strict response-size bound for auxiliary calls.
+ * @param recoverRejectedInlineImages Retry once without rejected inline images.
+ * @param transportFetch Optional caller-provided fetch transport.
  * @returns The parsed successful Responses JSON result.
  * @throws {Error} When canonicalization, entitlement, payload policy, or transport validation fails.
  */
@@ -523,6 +584,8 @@ export async function createXaiResponse(
   signal?: AbortSignal,
   beforeSend?: () => void,
   maxResponseBytes?: number,
+  recoverRejectedInlineImages = false,
+  transportFetch?: typeof fetch,
 ): Promise<any> {
   const canonicalBody = canonicalizeXaiResponsesPayload(body);
   const requestedModel =
@@ -572,14 +635,41 @@ export async function createXaiResponse(
       sessionId: requestSessionId,
     },
   );
-  return postXaiJson(
-    credential.token,
-    route.url,
-    payload,
-    signal,
-    requestHeaders,
-    maxResponseBytes,
-  );
+  try {
+    return await postXaiJson(
+      credential.token,
+      route.url,
+      payload,
+      signal,
+      requestHeaders,
+      maxResponseBytes,
+      transportFetch,
+    );
+  } catch (error) {
+    if (
+      !recoverRejectedInlineImages ||
+      !(error instanceof XaiHttpError) ||
+      error.code !== "invalid-image" ||
+      signal?.aborted
+    ) {
+      throw error;
+    }
+    const recoveryPayload = omitRejectedXaiInlineImages(payload);
+    if (recoveryPayload === payload) throw error;
+    assertXaiRuntimeModelAcceptsPayload(selectedModelId, recoveryPayload);
+    return postXaiJson(
+      credential.token,
+      route.url,
+      recoveryPayload,
+      signal,
+      {
+        ...requestHeaders,
+        "x-grok-req-id": randomUUID(),
+      },
+      maxResponseBytes,
+      transportFetch,
+    );
+  }
 }
 
 /**
@@ -605,7 +695,7 @@ export async function createXaiResponse(
 export function streamSimpleXaiResponses(
   model: Model<Api>,
   context: Context,
-  options?: SimpleStreamOptions,
+  options?: XaiSimpleStreamOptions,
   visionRouting?: XaiVisionRoutingController,
 ) {
   const runtimeModel = getXaiRuntimeModel(model.id);
@@ -707,14 +797,19 @@ export function streamSimpleXaiResponses(
   const stream = createForwardingAssistantStream();
   let grokNativeToolRoutes: GrokNativeToolRoutes = {};
   void (async () => {
-    // Pi's generic OpenAI delegate does not expose fetch redirect controls.
-    // Keep one URL-scoped guard installed only for the lifetime of active xAI
-    // streams; unrelated requests pass through unchanged, and overlapping xAI
-    // streams share the same guard until the last request completes.
-    const releaseRedirectGuard = acquireRedirectGuard(
-      route.url,
-      requestHeaders["x-grok-req-id"],
-    );
+    const releaseRedirectGuard = options?.fetch
+      ? () => {}
+      : acquireRedirectGuard(
+          route.url,
+          requestHeaders["x-grok-req-id"],
+        );
+    const transportFetch = options?.fetch
+      ? createXaiResponsesFetch(
+          options.fetch,
+          route.url,
+          requestHeaders["x-grok-req-id"],
+        )
+      : globalThis.fetch;
     try {
       const inner = streamSimpleOpenAIResponses(
         openAIResponsesModel as Model<"openai-responses">,
@@ -727,6 +822,10 @@ export function streamSimpleXaiResponses(
           // rewrite below still receives the stable session for cache keys.
           sessionId: undefined,
           headers,
+          // Use a caller-provided transport when present. Older Pi delegates
+          // ignore this option, so requests without one also use the temporary
+          // URL-scoped global fallback installed above.
+          fetch: transportFetch,
           // A retry would reuse a once-validated payload after the current
           // entitlement snapshot may have changed. Higher layers can retry by
           // starting a fresh request that repeats every local guard.
@@ -803,6 +902,8 @@ export function streamSimpleXaiResponses(
                     throw new Error(XAI_VISION_ROUTING_INVALIDATED_ERROR);
                 },
                 256 * 1024,
+                true,
+                options?.fetch,
               );
               if (!visionRouting?.validate(plan))
                 throw new Error(XAI_VISION_ROUTING_INVALIDATED_ERROR);
@@ -829,7 +930,7 @@ export function streamSimpleXaiResponses(
             assertXaiRuntimeModelAcceptsPayload(selectedModelId, finalPayload);
             return finalPayload;
           },
-        },
+        } as XaiSimpleStreamOptions,
       );
       for await (const event of inner as AsyncIterable<AssistantStreamEvent>) {
         if (event.type === "done" || event.type === "error")
