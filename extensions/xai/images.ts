@@ -50,13 +50,83 @@ export async function preserveSafeXaiInlineImage(
   }
 }
 
+/** Resize through the package codec when the host omits Pi's public helper. */
+export async function resizeXaiInlineImageWithoutHost(
+  bytes: Buffer,
+  mimeType: string,
+  options: XaiResizeOptions,
+): Promise<XaiResizeResult | null> {
+  const preserved = await preserveSafeXaiInlineImage(bytes, mimeType, options);
+  if (preserved) return preserved;
+
+  let image: { free(): void } | undefined;
+  try {
+    const photon = await import("@silvia-odwyer/photon-node");
+    image = photon.PhotonImage.new_from_byteslice(new Uint8Array(bytes));
+    const source = image as typeof image & {
+      get_width(): number;
+      get_height(): number;
+    };
+    let width = source.get_width();
+    let height = source.get_height();
+    if (width > options.maxWidth) {
+      height = Math.max(1, Math.round((height * options.maxWidth) / width));
+      width = options.maxWidth;
+    }
+    if (height > options.maxHeight) {
+      width = Math.max(1, Math.round((width * options.maxHeight) / height));
+      height = options.maxHeight;
+    }
+
+    const qualities = Array.from(
+      new Set([options.jpegQuality, 85, 70, 55, 40]),
+    );
+    while (true) {
+      const resized = photon.resize(
+        source as any,
+        width,
+        height,
+        photon.SamplingFilter.Lanczos3,
+      );
+      try {
+        const candidates = [
+          { bytes: resized.get_bytes(), mimeType: "image/png" },
+          ...qualities.map((quality) => ({
+            bytes: resized.get_bytes_jpeg(quality),
+            mimeType: "image/jpeg",
+          })),
+        ];
+        for (const candidate of candidates) {
+          const data = Buffer.from(candidate.bytes).toString("base64");
+          if (Buffer.byteLength(data, "utf8") < options.maxBytes) {
+            return { data, mimeType: candidate.mimeType };
+          }
+        }
+      } finally {
+        resized.free();
+      }
+
+      if (width === 1 && height === 1) return null;
+      const nextWidth = width === 1 ? 1 : Math.max(1, Math.floor(width * 0.75));
+      const nextHeight = height === 1 ? 1 : Math.max(1, Math.floor(height * 0.75));
+      if (nextWidth === width && nextHeight === height) return null;
+      width = nextWidth;
+      height = nextHeight;
+    }
+  } catch {
+    return null;
+  } finally {
+    image?.free();
+  }
+}
+
 const hostResizeImage = (
   piCodingAgent as typeof piCodingAgent & { resizeImage?: XaiResizeImage }
 ).resizeImage;
 const resizeXaiImage: XaiResizeImage =
   typeof hostResizeImage === "function"
     ? hostResizeImage
-    : preserveSafeXaiInlineImage;
+    : resizeXaiInlineImageWithoutHost;
 
 /**
  * Input-side caps enforced during payload traversal before whitespace

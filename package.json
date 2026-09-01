@@ -45,6 +45,9 @@
     "brace-expansion": "^5.0.8",
     "protobufjs": "^7.6.5"
   },
+  "dependencies": {
+    "@silvia-odwyer/photon-node": "0.3.4"
+  },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.80.1 <0.85.0",
     "@earendil-works/pi-coding-agent": ">=0.80.1 <0.85.0"

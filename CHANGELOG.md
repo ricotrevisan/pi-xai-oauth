@@ -9,6 +9,7 @@ Dates below are npm publication dates. The earliest rapid-release series is grou
 ### Fixed
 
 - Recover from xAI OAuth `invalid_image` rejections through the active per-request transport, including routed vision calls, by retrying once without rejected inline images while preserving remote image inputs and replacing removed images with an explicit placeholder.
+- Resize oversized inline PNG/JPEG inputs with the package codec when the host does not export Pi's resize helper, while preserving the same byte and dimension limits.
 
 ## 1.5.2 - 2026-08-23
 

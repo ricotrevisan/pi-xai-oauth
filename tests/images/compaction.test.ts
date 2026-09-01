@@ -8,7 +8,9 @@ import {
   MAX_XAI_INLINE_IMAGE_INPUT_COUNT,
   MAX_XAI_INLINE_IMAGE_PAYLOAD_MAX_DEPTH,
   preserveSafeXaiInlineImage,
+  resizeXaiInlineImageWithoutHost,
 } from "../../extensions/xai/images";
+import { inspectSupportedImageBytes } from "../../extensions/xai/media/image-info";
 
 function urls(value: any) {
   const result: string[] = [];
@@ -76,6 +78,19 @@ describe("inline image compaction", () => {
       maxBytes: base64Length,
       jpegQuality: 95,
     })).resolves.toBeNull();
+
+    const resized = await resizeXaiInlineImageWithoutHost(bytes, "image/jpeg", {
+      maxWidth: 500,
+      maxHeight: 2000,
+      maxBytes: base64Length + 1,
+      jpegQuality: 95,
+    });
+    expect(resized).not.toBeNull();
+    const inspected = inspectSupportedImageBytes(
+      Buffer.from(resized!.data, "base64"),
+      { maxPixels: 1_000_000, maxSidePx: 2000 },
+    );
+    expect(inspected.width).toBeLessThanOrEqual(500);
   });
 
   it("obeys aggregate byte and dimension bounds", async () => {
