@@ -1,3 +1,4 @@
+import * as PiAi from "@earendil-works/pi-ai";
 import type {
   Api,
   AssistantMessage,
@@ -5,7 +6,7 @@ import type {
   Model,
   SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import { openAIResponsesApi } from "@earendil-works/pi-ai/compat";
+import type { openAIResponsesApi as OpenAIResponsesApiFactory } from "@earendil-works/pi-ai/compat";
 import { randomUUID } from "crypto";
 import { readBoundedResponseText } from "./bounded-body";
 import { compactXaiInlineImages } from "./images";
@@ -56,7 +57,24 @@ interface AssistantStreamEvent {
   [key: string]: unknown;
 }
 
-const streamSimpleOpenAIResponses = openAIResponsesApi().streamSimple;
+type OpenAIResponsesDelegate = ReturnType<
+  typeof OpenAIResponsesApiFactory
+>["streamSimple"];
+
+let openAIResponsesDelegatePromise: Promise<OpenAIResponsesDelegate> | undefined;
+
+function resolveOpenAIResponsesDelegate(): Promise<OpenAIResponsesDelegate> {
+  if (openAIResponsesDelegatePromise) return openAIResponsesDelegatePromise;
+  const hostStreamSimple = (
+    PiAi as typeof PiAi & { streamSimple?: unknown }
+  ).streamSimple;
+  openAIResponsesDelegatePromise = typeof hostStreamSimple === "function"
+    ? Promise.resolve(hostStreamSimple as OpenAIResponsesDelegate)
+    : import("@earendil-works/pi-ai/compat").then(
+        ({ openAIResponsesApi }) => openAIResponsesApi().streamSimple,
+      );
+  return openAIResponsesDelegatePromise;
+}
 const SAFE_TEXT_ONLY_ERROR_PATTERN =
   /^xAI OAuth model [A-Za-z0-9][A-Za-z0-9._:-]{0,127} is explicitly text-only in the authenticated model catalog; no xAI request was sent$/;
 const SAFE_PAYLOAD_MODEL_ERROR =
@@ -648,6 +666,7 @@ export function streamSimpleXaiResponses(
     // streams share the same guard until the last request completes.
     const releaseRedirectGuard = acquireRedirectGuard(route.url);
     try {
+      const streamSimpleOpenAIResponses = await resolveOpenAIResponsesDelegate();
       const inner = streamSimpleOpenAIResponses(
         openAIResponsesModel as Model<"openai-responses">,
         delegateContext,
