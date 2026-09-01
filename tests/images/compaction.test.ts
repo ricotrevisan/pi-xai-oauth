@@ -7,6 +7,7 @@ import {
   MAX_XAI_INLINE_IMAGE_INPUT_BASE64_CHARS,
   MAX_XAI_INLINE_IMAGE_INPUT_COUNT,
   MAX_XAI_INLINE_IMAGE_PAYLOAD_MAX_DEPTH,
+  preserveSafeXaiInlineImage,
 } from "../../extensions/xai/images";
 
 function urls(value: any) {
@@ -49,6 +50,34 @@ describe("inline image compaction", () => {
       urls(await compactXaiInlineImages(payload, base64.length * 2 + 1)),
     ).toEqual([url, url]);
   });
+  it("preserves only byte- and dimension-safe images without the host resize helper", async () => {
+    const bytes = await readFile("preview.jpeg");
+    const base64Length = bytes.toString("base64").length;
+    const preserved = await preserveSafeXaiInlineImage(bytes, "image/jpeg", {
+      maxWidth: 2000,
+      maxHeight: 2000,
+      maxBytes: base64Length + 1,
+      jpegQuality: 95,
+    });
+
+    expect(preserved).toEqual({
+      data: bytes.toString("base64"),
+      mimeType: "image/jpeg",
+    });
+    await expect(preserveSafeXaiInlineImage(bytes, "image/jpeg", {
+      maxWidth: 1,
+      maxHeight: 1,
+      maxBytes: base64Length + 1,
+      jpegQuality: 95,
+    })).resolves.toBeNull();
+    await expect(preserveSafeXaiInlineImage(bytes, "image/jpeg", {
+      maxWidth: 2000,
+      maxHeight: 2000,
+      maxBytes: base64Length,
+      jpegQuality: 95,
+    })).resolves.toBeNull();
+  });
+
   it("obeys aggregate byte and dimension bounds", async () => {
     const base64 = (await readFile("preview.jpeg")).toString("base64");
     const url = `data:image/jpeg;base64,${base64}`;

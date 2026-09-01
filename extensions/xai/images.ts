@@ -1,7 +1,8 @@
 import { extname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { resizeImage } from "@earendil-works/pi-coding-agent";
+import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 import { MEDIA_MAX_DATA_URL_CHARS } from "./media/constants";
+import { inspectSupportedImageBytes } from "./media/image-info";
 import { toImageDataUrl } from "./media/data-url";
 import { readBoundedWorkspaceImageFileSync } from "./media/paths";
 import type { SupportedImageMimeType } from "./media/types";
@@ -10,6 +11,52 @@ import type { SupportedImageMimeType } from "./media/types";
 export const MAX_XAI_INLINE_IMAGE_BASE64_BYTES = 3 * 1024 * 1024;
 export const MAX_XAI_IMAGE_DIMENSION = 2000;
 export const XAI_JPEG_QUALITY = 95;
+
+interface XaiResizeOptions {
+  maxWidth: number;
+  maxHeight: number;
+  maxBytes: number;
+  jpegQuality: number;
+}
+
+interface XaiResizeResult {
+  data: string;
+  mimeType: string;
+}
+
+type XaiResizeImage = (
+  bytes: Buffer,
+  mimeType: string,
+  options: XaiResizeOptions,
+) => Promise<XaiResizeResult | null>;
+
+/** Preserve an already-safe image when the host does not export Pi's resize helper. */
+export async function preserveSafeXaiInlineImage(
+  bytes: Buffer,
+  mimeType: string,
+  options: XaiResizeOptions,
+): Promise<XaiResizeResult | null> {
+  try {
+    const inspected = inspectSupportedImageBytes(bytes, {
+      maxPixels: options.maxWidth * options.maxHeight,
+      maxSidePx: Math.max(options.maxWidth, options.maxHeight),
+    });
+    if (inspected.mimeType !== mimeType) return null;
+    const data = bytes.toString("base64");
+    if (Buffer.byteLength(data, "utf8") >= options.maxBytes) return null;
+    return { data, mimeType: inspected.mimeType };
+  } catch {
+    return null;
+  }
+}
+
+const hostResizeImage = (
+  piCodingAgent as typeof piCodingAgent & { resizeImage?: XaiResizeImage }
+).resizeImage;
+const resizeXaiImage: XaiResizeImage =
+  typeof hostResizeImage === "function"
+    ? hostResizeImage
+    : preserveSafeXaiInlineImage;
 
 /**
  * Input-side caps enforced during payload traversal before whitespace
@@ -262,7 +309,7 @@ export async function compactXaiInlineImages(
     let resized;
     let compressionError: unknown;
     try {
-      resized = await resizeImage(bytes, reference.mimeType, {
+      resized = await resizeXaiImage(bytes, reference.mimeType, {
         maxWidth: MAX_XAI_IMAGE_DIMENSION,
         maxHeight: MAX_XAI_IMAGE_DIMENSION,
         maxBytes: reference.targetSize + 1,
