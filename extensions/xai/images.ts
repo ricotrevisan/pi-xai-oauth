@@ -123,10 +123,25 @@ export async function resizeXaiInlineImageWithoutHost(
 const hostResizeImage = (
   piCodingAgent as typeof piCodingAgent & { resizeImage?: XaiResizeImage }
 ).resizeImage;
-const resizeXaiImage: XaiResizeImage =
-  typeof hostResizeImage === "function"
-    ? hostResizeImage
-    : resizeXaiInlineImageWithoutHost;
+
+/**
+ * Prime's bundled `resizeImage` is `(img, options)` and is aliased over Pi's
+ * `(bytes, mimeType, options)` helper. Prefer already-safe originals, then a
+ * matching Pi helper, then the package codec.
+ */
+const resizeXaiImage: XaiResizeImage = async (bytes, mimeType, options) => {
+  const preserved = await preserveSafeXaiInlineImage(bytes, mimeType, options);
+  if (preserved) return preserved;
+  if (typeof hostResizeImage === "function" && hostResizeImage.length >= 3) {
+    try {
+      const resized = await hostResizeImage(bytes, mimeType, options);
+      if (resized) return resized;
+    } catch {
+      // Host helper is present but not Pi-compatible.
+    }
+  }
+  return resizeXaiInlineImageWithoutHost(bytes, mimeType, options);
+};
 
 /**
  * Input-side caps enforced during payload traversal before whitespace
